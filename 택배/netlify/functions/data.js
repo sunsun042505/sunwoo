@@ -1,34 +1,27 @@
 import { getStore } from "@netlify/blobs";
 
-function json(status, obj) {
-  return new Response(JSON.stringify(obj), {
+const j = (status, obj) =>
+  new Response(JSON.stringify(obj), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
     },
   });
-}
 
-function nowStr() {
+const nowStr = () => {
   const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(
     d.getHours()
-  )}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
-
-// key 규칙
-// 예약: res:<reserveNo>  -> { ...rec }
-// 운송장 인덱스: wb:<waybillNo> -> reserveNo
-// 점포: store:<code> -> {name, code, createdAt}
-// 기사: courier:<code> -> {name, phone, code, createdAt}
+  )}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
 
 async function listReservations(store) {
   const { blobs } = await store.list({ prefix: "res:" });
   const out = [];
   for (const b of blobs) {
-    const s = await store.get(b.key, { consistency: "strong" });
+    const s = await store.get(b.key);
     if (s) out.push(JSON.parse(s));
   }
   out.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
@@ -36,12 +29,12 @@ async function listReservations(store) {
 }
 
 async function getByReserve(store, reserveNo) {
-  const s = await store.get(`res:${reserveNo}`, { consistency: "strong" });
+  const s = await store.get(`res:${reserveNo}`);
   return s ? JSON.parse(s) : null;
 }
 
 async function getByWaybill(store, waybillNo) {
-  const reserveNo = await store.get(`wb:${waybillNo}`, { consistency: "strong" });
+  const reserveNo = await store.get(`wb:${waybillNo}`);
   if (!reserveNo) return null;
   return getByReserve(store, reserveNo);
 }
@@ -49,53 +42,47 @@ async function getByWaybill(store, waybillNo) {
 async function upsertReservation(store, rec) {
   rec.updatedAt = nowStr();
   await store.set(`res:${rec.reserveNo}`, JSON.stringify(rec));
-  if (rec.waybillNo) {
-    await store.set(`wb:${rec.waybillNo}`, rec.reserveNo);
-  }
+  if (rec.waybillNo) await store.set(`wb:${rec.waybillNo}`, rec.reserveNo);
   return rec;
 }
 
-// ✅ Netlify Functions v2: Request/Response 형태로 export default
+// ✅ Netlify Functions v2: Request -> Response
 export default async (request) => {
   try {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
 
-    // /api/*  -> /.netlify/functions/data/:splat
-    // 여기서는 /data/ 뒤의 경로를 뽑아냄
+    // store 생성: 문서 예시대로 object 옵션 가능 (name/consistency) :contentReference[oaicite:1]{index=1}
+    const store = getStore({ name: "sunwoo-takbae-v1", consistency: "strong" });
+
+    // /.netlify/functions/data/<...> 로 들어오는 걸 기준으로 path 추출
     const base = "/.netlify/functions/data";
     let path = url.pathname.startsWith(base) ? url.pathname.slice(base.length) : url.pathname;
     if (!path.startsWith("/")) path = "/" + path;
     path = path.replace(/\/+$/, "") || "/";
 
-    // store 준비 (강일관으로)
-    const store = getStore("sunwoo-takbae-v1");
-
-
     // ---- Reservations ----
     if (method === "GET" && path === "/reservations") {
-      return json(200, await listReservations(store));
+      return j(200, await listReservations(store));
     }
 
     if (method === "GET" && path.startsWith("/reservations/byReserve/")) {
       const reserveNo = decodeURIComponent(path.replace("/reservations/byReserve/", ""));
       const rec = await getByReserve(store, reserveNo);
-      if (!rec) return json(404, { error: "NOT_FOUND" });
-      return json(200, rec);
+      return rec ? j(200, rec) : j(404, { error: "NOT_FOUND" });
     }
 
     if (method === "GET" && path.startsWith("/reservations/byWaybill/")) {
       const waybillNo = decodeURIComponent(path.replace("/reservations/byWaybill/", ""));
       const rec = await getByWaybill(store, waybillNo);
-      if (!rec) return json(404, { error: "NOT_FOUND" });
-      return json(200, rec);
+      return rec ? j(200, rec) : j(404, { error: "NOT_FOUND" });
     }
 
     if (method === "POST" && path === "/reservations/upsert") {
       const rec = await request.json();
-      if (!rec?.reserveNo) return json(400, { error: "reserveNo required" });
+      if (!rec?.reserveNo) return j(400, { error: "reserveNo required" });
       const saved = await upsertReservation(store, rec);
-      return json(200, { ok: true, rec: saved });
+      return j(200, { ok: true, rec: saved });
     }
 
     // ---- Stores ----
@@ -103,13 +90,13 @@ export default async (request) => {
       const body = await request.json();
       const name = String(body?.name || "").trim();
       const code = String(body?.code || "").trim();
-      if (!name || !code) return json(400, { error: "name/code required" });
+      if (!name || !code) return j(400, { error: "name/code required" });
 
-      const exist = await store.get(`store:${code}`, { consistency: "strong" });
-      if (exist) return json(409, { error: "DUPLICATE_CODE" });
+      const exist = await store.get(`store:${code}`);
+      if (exist) return j(409, { error: "DUPLICATE_CODE" });
 
       await store.set(`store:${code}`, JSON.stringify({ name, code, createdAt: nowStr() }));
-      return json(200, { ok: true });
+      return j(200, { ok: true });
     }
 
     if (method === "POST" && path === "/stores/login") {
@@ -117,12 +104,12 @@ export default async (request) => {
       const name = String(body?.name || "").trim();
       const code = String(body?.code || "").trim();
 
-      const s = await store.get(`store:${code}`, { consistency: "strong" });
-      if (!s) return json(404, { error: "NO_STORE" });
+      const s = await store.get(`store:${code}`);
+      if (!s) return j(404, { error: "NO_STORE" });
       const obj = JSON.parse(s);
-      if (obj.name !== name) return json(404, { error: "NO_STORE" });
+      if (obj.name !== name) return j(404, { error: "NO_STORE" });
 
-      return json(200, { ok: true, store: obj });
+      return j(200, { ok: true, store: obj });
     }
 
     // ---- Couriers ----
@@ -131,30 +118,27 @@ export default async (request) => {
       const name = String(body?.name || "").trim();
       const phone = String(body?.phone || "").trim();
       const code = String(body?.code || "").trim();
-      if (!name || !phone || !code) return json(400, { error: "name/phone/code required" });
+      if (!name || !phone || !code) return j(400, { error: "name/phone/code required" });
 
-      const exist = await store.get(`courier:${code}`, { consistency: "strong" });
-      if (exist) return json(409, { error: "DUPLICATE_CODE" });
+      const exist = await store.get(`courier:${code}`);
+      if (exist) return j(409, { error: "DUPLICATE_CODE" });
 
-      await store.set(
-        `courier:${code}`,
-        JSON.stringify({ name, phone, code, createdAt: nowStr() })
-      );
-      return json(200, { ok: true });
+      await store.set(`courier:${code}`, JSON.stringify({ name, phone, code, createdAt: nowStr() }));
+      return j(200, { ok: true });
     }
 
     if (method === "POST" && path === "/couriers/login") {
       const body = await request.json();
       const code = String(body?.code || "").trim();
 
-      const s = await store.get(`courier:${code}`, { consistency: "strong" });
-      if (!s) return json(404, { error: "NO_COURIER" });
+      const s = await store.get(`courier:${code}`);
+      if (!s) return j(404, { error: "NO_COURIER" });
 
-      return json(200, { ok: true, courier: JSON.parse(s) });
+      return j(200, { ok: true, courier: JSON.parse(s) });
     }
 
-    return json(404, { error: "NO_ROUTE", method, path });
+    return j(404, { error: "NO_ROUTE", method, path });
   } catch (e) {
-    return json(500, { error: "SERVER_ERROR", detail: String(e?.message || e) });
+    return j(500, { error: "SERVER_ERROR", detail: String(e?.message || e) });
   }
 };
